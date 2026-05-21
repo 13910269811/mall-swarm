@@ -4,11 +4,11 @@ spring:
     username: root
     password: root
   elasticsearch:
-    rest:
-      uris: http://localhost:9200
+    uris: localhost:9200
 logging:
   level:
     root: info
     com.macro.mall: debug
 logstash:
   host: localhost
+  enableInnerLog: false

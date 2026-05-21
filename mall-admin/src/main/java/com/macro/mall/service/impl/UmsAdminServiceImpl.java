@@ -1,27 +1,28 @@
 package com.macro.mall.service.impl;
 
+import cn.dev33.satoken.stp.SaTokenInfo;
+import cn.dev33.satoken.stp.StpUtil;
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.crypto.digest.BCrypt;
+import cn.hutool.extra.spring.SpringUtil;
 import cn.hutool.json.JSONUtil;
 import com.github.pagehelper.PageHelper;
 import com.macro.mall.common.api.CommonResult;
 import com.macro.mall.common.api.ResultCode;
 import com.macro.mall.common.constant.AuthConstant;
-import com.macro.mall.common.domain.UserDto;
+import com.macro.mall.common.dto.UserDto;
 import com.macro.mall.common.exception.Asserts;
-import com.macro.mall.dao.UmsAdminPermissionRelationDao;
 import com.macro.mall.dao.UmsAdminRoleRelationDao;
 import com.macro.mall.dto.UmsAdminParam;
 import com.macro.mall.dto.UpdateAdminPasswordParam;
 import com.macro.mall.mapper.UmsAdminLoginLogMapper;
 import com.macro.mall.mapper.UmsAdminMapper;
-import com.macro.mall.mapper.UmsAdminPermissionRelationMapper;
 import com.macro.mall.mapper.UmsAdminRoleRelationMapper;
 import com.macro.mall.model.*;
-import com.macro.mall.service.AuthService;
 import com.macro.mall.service.UmsAdminCacheService;
 import com.macro.mall.service.UmsAdminService;
+import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.BeanUtils;
@@ -32,7 +33,6 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 
-import javax.servlet.http.HttpServletRequest;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -50,17 +50,9 @@ public class UmsAdminServiceImpl implements UmsAdminService {
     @Autowired
     private UmsAdminRoleRelationDao adminRoleRelationDao;
     @Autowired
-    private UmsAdminPermissionRelationMapper adminPermissionRelationMapper;
-    @Autowired
-    private UmsAdminPermissionRelationDao adminPermissionRelationDao;
-    @Autowired
     private UmsAdminLoginLogMapper loginLogMapper;
     @Autowired
-    private AuthService authService;
-    @Autowired
     private UmsAdminCacheService adminCacheService;
-    @Autowired
-    private HttpServletRequest request;
 
     @Override
     public UmsAdmin getAdminByUsername(String username) {
@@ -94,30 +86,42 @@ public class UmsAdminServiceImpl implements UmsAdminService {
     }
 
     @Override
-    public CommonResult login(String username, String password) {
+    public SaTokenInfo login(String username, String password) {
         if(StrUtil.isEmpty(username)||StrUtil.isEmpty(password)){
             Asserts.fail("用户名或密码不能为空！");
         }
-        Map<String, String> params = new HashMap<>();
-        params.put("client_id", AuthConstant.ADMIN_CLIENT_ID);
-        params.put("client_secret","123456");
-        params.put("grant_type","password");
-        params.put("username",username);
-        params.put("password",password);
-        CommonResult restResult = authService.getAccessToken(params);
-        if(ResultCode.SUCCESS.getCode()==restResult.getCode()&&restResult.getData()!=null){
-//            updateLoginTimeByUsername(username);
-            insertLoginLog(username);
+        UmsAdmin admin = getAdminByUsername(username);
+        if(admin==null){
+            Asserts.fail("找不到该用户！");
         }
-        return restResult;
+        if (!BCrypt.checkpw(password, admin.getPassword())) {
+            Asserts.fail("密码不正确！");
+        }
+        if(admin.getStatus()!=1){
+            Asserts.fail("该账号已被禁用！");
+        }
+        // 登录校验成功后，一行代码实现登录
+        StpUtil.login(admin.getId());
+        UserDto userDto = new UserDto();
+        userDto.setId(admin.getId());
+        userDto.setUsername(admin.getUsername());
+        userDto.setClientId(AuthConstant.ADMIN_CLIENT_ID);
+        List<UmsResource> resourceList = getResourceList(admin.getId());
+        List<String> permissionList = resourceList.stream().map(item -> item.getId() + ":" + item.getName()).toList();
+        userDto.setPermissionList(permissionList);
+        // 将用户信息存储到Session中
+        StpUtil.getSession().set(AuthConstant.STP_ADMIN_INFO,userDto);
+        // 获取当前登录用户Token信息
+        SaTokenInfo saTokenInfo = StpUtil.getTokenInfo();
+//        updateLoginTimeByUsername(username);
+        insertLoginLog(admin);
+        return saTokenInfo;
     }
 
     /**
      * 添加登录记录
-     * @param username 用户名
      */
-    private void insertLoginLog(String username) {
-        UmsAdmin admin = getAdminByUsername(username);
+    private void insertLoginLog(UmsAdmin admin) {
         if(admin==null) return;
         UmsAdminLoginLog loginLog = new UmsAdminLoginLog();
         loginLog.setAdminId(admin.getId());
@@ -215,48 +219,6 @@ public class UmsAdminServiceImpl implements UmsAdminService {
     }
 
     @Override
-    public int updatePermission(Long adminId, List<Long> permissionIds) {
-        //删除原所有权限关系
-        UmsAdminPermissionRelationExample relationExample = new UmsAdminPermissionRelationExample();
-        relationExample.createCriteria().andAdminIdEqualTo(adminId);
-        adminPermissionRelationMapper.deleteByExample(relationExample);
-        //获取用户所有角色权限
-        List<UmsPermission> permissionList = adminRoleRelationDao.getRolePermissionList(adminId);
-        List<Long> rolePermissionList = permissionList.stream().map(UmsPermission::getId).collect(Collectors.toList());
-        if (!CollectionUtils.isEmpty(permissionIds)) {
-            List<UmsAdminPermissionRelation> relationList = new ArrayList<>();
-            //筛选出+权限
-            List<Long> addPermissionIdList = permissionIds.stream().filter(permissionId -> !rolePermissionList.contains(permissionId)).collect(Collectors.toList());
-            //筛选出-权限
-            List<Long> subPermissionIdList = rolePermissionList.stream().filter(permissionId -> !permissionIds.contains(permissionId)).collect(Collectors.toList());
-            //插入+-权限关系
-            relationList.addAll(convert(adminId,1,addPermissionIdList));
-            relationList.addAll(convert(adminId,-1,subPermissionIdList));
-            return adminPermissionRelationDao.insertList(relationList);
-        }
-        return 0;
-    }
-
-    /**
-     * 将+-权限关系转化为对象
-     */
-    private List<UmsAdminPermissionRelation> convert(Long adminId,Integer type,List<Long> permissionIdList) {
-        List<UmsAdminPermissionRelation> relationList = permissionIdList.stream().map(permissionId -> {
-            UmsAdminPermissionRelation relation = new UmsAdminPermissionRelation();
-            relation.setAdminId(adminId);
-            relation.setType(type);
-            relation.setPermissionId(permissionId);
-            return relation;
-        }).collect(Collectors.toList());
-        return relationList;
-    }
-
-    @Override
-    public List<UmsPermission> getPermissionList(Long adminId) {
-        return adminRoleRelationDao.getPermissionList(adminId);
-    }
-
-    @Override
     public int updatePassword(UpdateAdminPasswordParam param) {
         if(StrUtil.isEmpty(param.getUsername())
                 ||StrUtil.isEmpty(param.getOldPassword())
@@ -280,36 +242,21 @@ public class UmsAdminServiceImpl implements UmsAdminService {
     }
 
     @Override
-    public UserDto loadUserByUsername(String username){
-        //获取用户信息
-        UmsAdmin admin = getAdminByUsername(username);
-        if (admin != null) {
-            List<UmsRole> roleList = getRoleList(admin.getId());
-            UserDto userDTO = new UserDto();
-            BeanUtils.copyProperties(admin,userDTO);
-            if(CollUtil.isNotEmpty(roleList)){
-                List<String> roleStrList = roleList.stream().map(item -> item.getId() + "_" + item.getName()).collect(Collectors.toList());
-                userDTO.setRoles(roleStrList);
-            }
-            return userDTO;
-        }
-        return null;
-    }
-
-    @Override
     public UmsAdmin getCurrentAdmin() {
-        String userStr = request.getHeader(AuthConstant.USER_TOKEN_HEADER);
-        if(StrUtil.isEmpty(userStr)){
-            Asserts.fail(ResultCode.UNAUTHORIZED);
-        }
-        UserDto userDto = JSONUtil.toBean(userStr, UserDto.class);
+        UserDto userDto = (UserDto) StpUtil.getSession().get(AuthConstant.STP_ADMIN_INFO);
         UmsAdmin admin = adminCacheService.getAdmin(userDto.getId());
-        if(admin!=null){
-            return admin;
-        }else{
+        if (admin == null) {
             admin = adminMapper.selectByPrimaryKey(userDto.getId());
             adminCacheService.setAdmin(admin);
-            return admin;
         }
+        return admin;
+    }
+    @Override
+    public void logout() {
+        //先清空缓存
+        UserDto userDto = (UserDto) StpUtil.getSession().get(AuthConstant.STP_ADMIN_INFO);
+        adminCacheService.delAdmin(userDto.getId());
+        //再调用sa-token的登出方法
+        StpUtil.logout();
     }
 }
